@@ -21,12 +21,16 @@ func (s FinalizeStage) Execute(ctx *engine.CalcContext) error {
 	discounts := domain.NewMoney(0, ctx.Cart.Currency)
 	fees := domain.NewMoney(0, ctx.Cart.Currency)
 	taxes := domain.NewMoney(0, ctx.Cart.Currency)
+	rounding := domain.NewMoney(0, ctx.Cart.Currency)
 
-	// item discounts
+	// item discounts and rounding
 	for _, it := range ctx.Snapshot.Items {
 		for _, adj := range it.Adjustments {
-			if adj.Type == domain.AdjDiscount {
+			switch adj.Type {
+			case domain.AdjDiscount:
 				discounts = discounts.Add(adj.Amount)
+			case domain.AdjRounding:
+				rounding = rounding.Add(adj.Amount)
 			}
 		}
 	}
@@ -40,14 +44,17 @@ func (s FinalizeStage) Execute(ctx *engine.CalcContext) error {
 			fees = fees.Add(adj.Amount)
 		case domain.AdjTax:
 			taxes = taxes.Add(adj.Amount)
+		case domain.AdjRounding:
+			rounding = rounding.Add(adj.Amount)
 		}
 	}
 
 	ctx.Snapshot.Discounts = discounts
 	ctx.Snapshot.DeliveryFee = fees
 	ctx.Snapshot.Tax = taxes
+	ctx.Snapshot.Rounding = rounding
 
-	total := subtotal.Add(discounts).Add(fees).Add(taxes)
+	total := subtotal.Add(discounts).Add(fees).Add(taxes).Add(rounding)
 
 	if total.Amount < 0 {
 		return fmt.Errorf("invalid total: %d", total.Amount)

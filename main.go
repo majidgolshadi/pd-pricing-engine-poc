@@ -90,6 +90,15 @@ func main() {
 		stages.ApplyPromotionsStage{},
 		stages.DeliveryFeeStage{BaseFee: 299},
 		stages.TaxStage{VATPercent: 7},
+		stages.RoundingStage{
+			Policy: domain.RoundingPolicy{
+				ID:        "rounding-eur-v1",
+				Version:   "1.0.0",
+				Method:    domain.RoundHalfUp,
+				Scope:     domain.RoundOrderTotal,
+				Increment: 5, // round to nearest 5 cents; use 1 for standard cent precision
+			},
+		},
 		stages.FinalizeStage{},
 	)
 
