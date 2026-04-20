@@ -16,6 +16,7 @@ type PriceSnapshot struct {
 	Discounts   Money
 	DeliveryFee Money
 	Tax         Money
+	Rounding    Money
 	Total       Money
 
 	Adjustments []Adjustment // order-level adjustments only

@@ -6,6 +6,7 @@ const (
 	AdjDiscount AdjustmentType = "DISCOUNT"
 	AdjFee      AdjustmentType = "FEE"
 	AdjTax      AdjustmentType = "TAX"
+	AdjRounding AdjustmentType = "ROUNDING"
 )
 
 type Adjustment struct {
