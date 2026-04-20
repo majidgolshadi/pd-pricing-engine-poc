@@ -7,11 +7,42 @@ import (
 	"pricing-engine/internal/engine"
 )
 
-// RoundingStage applies a configurable rounding policy to the in-progress snapshot.
-// It must run after TaxStage and before FinalizeStage so that rounding is applied
-// to the fully-adjusted amount and is persisted as an explicit ROUNDING adjustment.
+// RoundingStage is the sixth stage in the pricing pipeline.
+// It applies a configurable rounding policy to the in-progress snapshot and emits
+// explicit ROUNDING adjustments for any deltas.
+//
+// # Why Rounding is a Dedicated Stage
+//
+// Rounding must be treated as a first-class part of pricing logic, NOT a UI formatting
+// step. Rounding differences affect:
+//   - The payable amount (what is charged to the customer)
+//   - Tax correctness (the tax base must be consistently rounded)
+//   - Reconciliation with payment providers (who enforce currency precision)
+//   - Invoice and ledger consistency (rounded totals must match across systems)
+//
+// By placing rounding near the end of the pipeline (after discounts, fees, and tax),
+// rounding is applied to the fully-adjusted amount in a controlled, deterministic way.
+//
+// # Rounding as an Explicit Adjustment
+//
+// Any rounding delta is persisted as a ROUNDING adjustment with full policy metadata
+// (policy ID, version, method, scope, increment). This ensures:
+//   - Rounding is auditable and reproducible
+//   - Historical totals reconcile correctly when recalculated
+//   - The exact rounding policy can be traced for any order
+//
+// # Supported Scopes (see domain.RoundingScope)
+//
+//   - ORDER_TOTAL: rounds the running total and emits a single ROUNDING adjustment
+//   - PER_ITEM: rounds each item's FinalTotal and emits item-level ROUNDING adjustments
+//   - PER_TAX: rounds each TAX adjustment individually and emits corresponding ROUNDING adjustments
+//
+// # Dependencies
+//
+// Must run AFTER TaxStage (rounding applies to the fully-adjusted amount including tax).
+// Must run BEFORE FinalizeStage (finalize aggregates all adjustments including rounding).
 type RoundingStage struct {
-	Policy domain.RoundingPolicy
+	Policy domain.RoundingPolicy // Configurable rounding policy (method, scope, increment)
 }
 
 func (s RoundingStage) Name() string { return "rounding" }
@@ -29,6 +60,13 @@ func (s RoundingStage) Execute(ctx *engine.CalcContext) error {
 }
 
 // roundOrderTotal rounds the entire running total and emits a single ROUNDING adjustment.
+//
+// This is the simplest and most common rounding scope. It computes the pre-rounding
+// total (exactly as FinalizeStage would), applies the rounding method, and if there's
+// a delta, emits an ORDER-level ROUNDING adjustment.
+//
+// Example: running total = 1463, increment = 5, method = HALF_UP
+//   → rounded = 1465, delta = +2 → ROUNDING adjustment with Amount = +2
 func (s RoundingStage) roundOrderTotal(ctx *engine.CalcContext) error {
 	raw := computeRunningTotal(ctx)
 
@@ -48,9 +86,14 @@ func (s RoundingStage) roundOrderTotal(ctx *engine.CalcContext) error {
 	return nil
 }
 
-// roundPerItem rounds each item's FinalTotal and emits an item-level ROUNDING adjustment
-// for items where a delta exists. FinalTotal is updated in place so downstream stages
-// (finalize) and the output snapshot reflect the rounded value.
+// roundPerItem rounds each item's FinalTotal and emits item-level ROUNDING adjustments
+// for items where a delta exists.
+//
+// FinalTotal is updated in place so that downstream stages (finalize) and the output
+// snapshot reflect the rounded value. This scope may produce multiple small rounding
+// adjustments (one per item) rather than a single order-level one.
+//
+// This scope is useful when per-item precision is required (e.g., for itemized invoices).
 func (s RoundingStage) roundPerItem(ctx *engine.CalcContext) error {
 	increment := s.Policy.Increment
 	if increment <= 0 {
@@ -75,7 +118,10 @@ func (s RoundingStage) roundPerItem(ctx *engine.CalcContext) error {
 }
 
 // roundPerTax rounds each individual TAX-type order adjustment, updating the adjustment
-// amount and emitting a corresponding ROUNDING adjustment for the delta.
+// amount in place and emitting a corresponding ROUNDING adjustment for the delta.
+//
+// This scope is required by some tax jurisdictions where each tax component must be
+// rounded independently before being summed into the total.
 func (s RoundingStage) roundPerTax(ctx *engine.CalcContext) error {
 	increment := s.Policy.Increment
 	if increment <= 0 {
@@ -97,7 +143,9 @@ func (s RoundingStage) roundPerTax(ctx *engine.CalcContext) error {
 			continue
 		}
 
+		// Update the tax adjustment amount in place to the rounded value.
 		adj.Amount = domain.NewMoney(rounded, ctx.Cart.Currency)
+		// Emit a ROUNDING adjustment recording the delta for auditability.
 		roundingAdjs = append(roundingAdjs, s.makeAdj(delta, "ORDER", ctx.Cart.Currency))
 	}
 
@@ -106,6 +154,9 @@ func (s RoundingStage) roundPerTax(ctx *engine.CalcContext) error {
 }
 
 // makeAdj builds a ROUNDING adjustment with full policy metadata for traceability.
+//
+// The metadata includes the policy ID, version, method, scope, and increment so that
+// any historical order's rounding can be fully traced and reproduced.
 func (s RoundingStage) makeAdj(delta int64, target, currency string) domain.Adjustment {
 	return domain.Adjustment{
 		ID:          "ROUNDING",
@@ -125,8 +176,13 @@ func (s RoundingStage) makeAdj(delta int64, target, currency string) domain.Adju
 }
 
 // computeRunningTotal accumulates the order total exactly as FinalizeStage would,
-// but without writing to the snapshot. Used by ORDER_TOTAL scope to determine the
-// pre-rounding amount.
+// but without writing to the snapshot.
+//
+// It sums:
+//   - All item LineTotals + item-level adjustments (which equals item FinalTotals)
+//   - All order-level adjustments (discounts, fees, taxes)
+//
+// This is used by the ORDER_TOTAL scope to determine the pre-rounding amount.
 func computeRunningTotal(ctx *engine.CalcContext) domain.Money {
 	total := domain.NewMoney(0, ctx.Cart.Currency)
 
