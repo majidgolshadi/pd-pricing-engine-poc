@@ -1,42 +1,58 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"pricing-engine/internal/domain"
 	"pricing-engine/internal/engine"
+	"pricing-engine/internal/infra/dynamo"
 	"pricing-engine/internal/promos"
 	"pricing-engine/internal/stages"
 )
 
 func main() {
-	cart := domain.Cart{
-		ID:       "cart-1",
-		StoreID:  "store-berlin",
-		UserID:   "user-123",
-		Currency: "EUR",
-		Items: []domain.LineItem{
-			{
-				SKU:       "burger",
-				Name:      "Burger",
-				Quantity:  3,
-				UnitPrice: domain.NewMoney(599, "EUR"),
+	ctx := context.Background()
+
+	// ── Connect to LocalStack DynamoDB ──────────────────────────────────
+	ddbClient, err := dynamo.NewLocalClient(ctx, "http://localhost:4566")
+	if err != nil {
+		log.Fatalf("creating DynamoDB client: %v", err)
+	}
+	repo := dynamo.NewSnapshotRepository(ddbClient)
+
+	orderCode := "order-9001"
+
+	// ── Build two carts to simulate two snapshots for the same order ────
+	carts := []domain.Cart{
+		{
+			ID:       "cart-1",
+			StoreID:  "store-berlin",
+			UserID:   "user-123",
+			Currency: "EUR",
+			Items: []domain.LineItem{
+				{SKU: "burger", Name: "Burger", Quantity: 3, UnitPrice: domain.NewMoney(599, "EUR")},
+				{SKU: "cola", Name: "Cola", Quantity: 2, UnitPrice: domain.NewMoney(199, "EUR")},
 			},
-			{
-				SKU:       "cola",
-				Name:      "Cola",
-				Quantity:  2,
-				UnitPrice: domain.NewMoney(199, "EUR"),
-			},
+			Coupon: &domain.CouponInput{Code: "FREEDEL"},
 		},
-		Coupon: &domain.CouponInput{Code: "FREEDEL"},
+		{
+			ID:       "cart-1",
+			StoreID:  "store-berlin",
+			UserID:   "user-123",
+			Currency: "EUR",
+			Items: []domain.LineItem{
+				{SKU: "burger", Name: "Burger", Quantity: 2, UnitPrice: domain.NewMoney(599, "EUR")},
+				{SKU: "cola", Name: "Cola", Quantity: 3, UnitPrice: domain.NewMoney(199, "EUR")},
+			},
+			Coupon: nil,
+		},
 	}
 
-	ctx := engine.NewContext(cart, time.Now())
-
-	ctx.Promotions = []domain.Promotion{
+	promotions := []domain.Promotion{
 		{
 			ID:             "promo-10off",
 			Code:           "PROMO10",
@@ -96,21 +112,72 @@ func main() {
 				Version:   "1.0.0",
 				Method:    domain.RoundHalfUp,
 				Scope:     domain.RoundOrderTotal,
-				Increment: 5, // round to nearest 5 cents; use 1 for standard cent precision
+				Increment: 5,
 			},
 		},
 		stages.FinalizeStage{},
 	)
 
-	if err := e.Calculate(ctx); err != nil {
-		panic(err)
+	// ── Calculate and persist two snapshots ─────────────────────────────
+	for i, cart := range carts {
+		calcCtx := engine.NewContext(cart, time.Now())
+		calcCtx.Promotions = promotions
+
+		if err := e.Calculate(calcCtx); err != nil {
+			log.Fatalf("calculation error (cart %d): %v", i+1, err)
+		}
+
+		// Copy promotion traces from engine trace to snapshot
+		for _, pt := range calcCtx.Trace.Promotions {
+			calcCtx.Snapshot.PromotionTraces = append(calcCtx.Snapshot.PromotionTraces, domain.PromotionTrace{
+				PromotionID: pt.PromoID,
+				Code:        pt.PromoCode,
+				Status:      pt.Status,
+				Reason:      pt.Reason,
+			})
+		}
+
+		saved, err := repo.Save(ctx, orderCode, cart.Currency, calcCtx.Snapshot)
+		if err != nil {
+			log.Fatalf("saving snapshot (cart %d): %v", i+1, err)
+		}
+		fmt.Printf("✅ Saved snapshot: order=%s version=%d\n", saved.OrderCode, saved.Version)
 	}
 
-	out, _ := json.MarshalIndent(ctx.Snapshot, "", "  ")
-	fmt.Println(string(out))
+	// ── Demo Query 1: Get all snapshots for the order ───────────────────
+	fmt.Println("\n═══ Query 1: All snapshots for order", orderCode, "═══")
+	allVersions, err := repo.GetAllVersions(ctx, orderCode)
+	if err != nil {
+		log.Fatalf("GetAllVersions: %v", err)
+	}
+	for _, s := range allVersions {
+		fmt.Printf("  version=%d  total=%d  created=%s\n",
+			s.Version, s.Snapshot.Total.Amount, s.CreatedAt.Format(time.RFC3339))
+	}
 
-	fmt.Println("\n----- promotion trace -----")
-	for _, t := range ctx.Trace.Promotions {
-		fmt.Printf("%s (%s) => %s (%s)\n", t.PromoCode, t.PromoID, t.Status, t.Reason)
+	// ── Demo Query 2: Get specific version ──────────────────────────────
+	fmt.Println("\n═══ Query 2: Specific version (order=", orderCode, ", version=1) ═══")
+	v1, err := repo.GetByVersion(ctx, orderCode, 1)
+	if err != nil {
+		log.Fatalf("GetByVersion: %v", err)
+	}
+	if v1 != nil {
+		out, _ := json.MarshalIndent(v1, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Println("  not found")
+	}
+
+	// ── Demo Query 3: Get latest version ────────────────────────────────
+	fmt.Println("\n═══ Query 3: Latest version for order", orderCode, "═══")
+	latest, err := repo.GetLatest(ctx, orderCode)
+	if err != nil {
+		log.Fatalf("GetLatest: %v", err)
+	}
+	if latest != nil {
+		out, _ := json.MarshalIndent(latest, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Println("  not found")
 	}
 }
