@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: pricing-engine-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=dynamodb
+      - DEFAULT_REGION=us-east-1
+      - EAGER_SERVICE_LOADING=1
+    volumes:
+      - "./scripts/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh"
